@@ -32,6 +32,9 @@ const WAF_CONFIG = {
   rateLimitMax: 60,
   rateLimitWindowMs: 60_000,
 
+  // [NEW] Integration with Vercel Edge Config for Global IP Banning
+  enableGlobalBanlist: true,
+
   // Security cap to prevent DoS and ReDoS (inspection payload limit).
   maxInspectionBytes: 32_768,
   maxUrlLength: 8192,
@@ -453,6 +456,35 @@ export default async function middleware(request) {
   const url = new URL(request.url);
   const rawPath = request.nextUrl?.pathname || url.pathname;
   const eventId = `WAF-${Date.now().toString(36).toUpperCase()}-${Math.floor(Math.random() * 1000)}`;
+
+  // --------------------------------------------------------------------------
+  // STAGE 0.5: Global Banlist (Vercel Edge Config)
+  // --------------------------------------------------------------------------
+  if (WAF_CONFIG.enableGlobalBanlist && process.env.EDGE_CONFIG) {
+    try {
+      // Native fetch to Edge Config URL (zero external dependencies).
+      // Expected Edge Config structure: { "waf_banned_ips": { "192.168.1.1": "2026-12-31T23:59:59Z" } }
+      const edgeUrl = new URL(process.env.EDGE_CONFIG);
+      edgeUrl.pathname = `/v1/items`; // Fetch all config items
+      
+      const res = await fetch(edgeUrl.toString());
+      if (res.ok) {
+        const configData = await res.json();
+        const bannedIps = configData.waf_banned_ips || {};
+        const clientIp = request.headers.get('x-vercel-forwarded-for')?.split(',')[0].trim() || request.headers.get('x-real-ip');
+        
+        if (clientIp && bannedIps[clientIp]) {
+          const unbanTime = new Date(bannedIps[clientIp]);
+          if (unbanTime > new Date()) {
+             emitTelemetryLog({ action: 'BLOCK', eventId, status: 403, reason: 'IP is globally banned (Edge Config)', ip: clientIp, path: rawPath });
+             return createWafResponse('BLOCK', 403, 'IP is globally banned', eventId, 100);
+          }
+        }
+      }
+    } catch (e) {
+      // Fail-open: If Edge Config is unreachable, fallback to local WAF evaluation silently.
+    }
+  }
 
   // --------------------------------------------------------------------------
   // STAGE 0: Allowlist Routes (Legitimate bypass for OAuth/Webhooks)
