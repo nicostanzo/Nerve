@@ -20,8 +20,8 @@ A high-performance, edge-native Web Application Firewall (WAF) designed specific
 
 Adjust the WAF_CONFIG settings at the top of the file:
 - mode: 'ENFORCE' (blocks threats) or 'OBSERVE' (logs only).
-- ateLimitMax: Maximum requests per minute per client fingerprint (default is 60).
-- ateLimitWindowMs: Sliding window time frame in milliseconds (default is 60000).
+- ateLimitMax: Maximum requests per minute per client fingerprint (default is 60).
+- ateLimitWindowMs: Sliding window time frame in milliseconds (default is 60000).
 
 ## Telemetry
 The WAF outputs telemetry logs to the standard Edge Function console. Each block event includes an Event ID, action, HTTP status code, and reason.
