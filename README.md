@@ -1,4 +1,4 @@
-# Parallax WAF
+# Nerve WAF
 
 A high-performance, edge-native Web Application Firewall (WAF) designed specifically for Vercel Edge Middleware.
 
@@ -25,4 +25,5 @@ Adjust the WAF_CONFIG settings at the top of the file:
 
 ## Telemetry
 The WAF outputs telemetry logs to the standard Edge Function console. Each block event includes an Event ID, action, HTTP status code, and reason.
+
 
