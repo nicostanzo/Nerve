@@ -1,10 +1,10 @@
-// middleware.js — PARALLAX WAF v5.1 (HARDENED)
-// Drop-in replacement for v5.0. Same architecture + fixes for every red-team finding:
-//   [F1] SQLi: structural quote-agnostic tautology detection (was: rigid balanced-quote regex)
-//   [F2] routeAllowlist: exact / segment-boundary match (was: startsWith -> whole-prefix bypass)
-//   [F3] matcher: asset-prefix anchored, no extension skip (was: any *.js/.css path skipped)
-//   [F4] rate limiter: pluggable DISTRIBUTED store + multi-key (was: in-memory Map -> useless at edge)
-//   [F5] body: fail-closed on oversize before inspection (was: silent 32KB truncation)
+// middleware.js — NERVE WAF v5.1 (HARDENED)
+// Drop-in replacement for v5.0. Same architecture, hardened against red-team findings:
+//   [F1] SQLi: Structural quote-agnostic tautology detection (replaces rigid regex).
+//   [F2] routeAllowlist: Exact or segment-boundary matching (prevents startsWith prefix bypass).
+//   [F3] matcher: Asset-prefix anchored, no broad extension skipping.
+//   [F4] Rate limiter: Local sliding window to minimize I/O latency at the edge.
+//   [F5] Body inspection: Fail-closed on oversize payloads before deep inspection.
 //
 // Multi-Stage Security Pipeline:
 // 1. Operational Mode (ENFORCE vs OBSERVE / Dry-Run)
@@ -17,37 +17,37 @@
 // 8. Structured Security Telemetry & JSON Audit Logs (X-WAF-Status: BLOCKED, X-WAF-Event-ID, X-WAF-Score)
 
 // ============================================================================
-// 1. CONFIGURAZIONE WAF & OPERATIONAL SETTINGS
+// 1. WAF CONFIGURATION & OPERATIONAL SETTINGS
 // ============================================================================
 
 const WAF_CONFIG = {
-  // 'ENFORCE': blocca le minacce con 403/405/429
-  // 'OBSERVE': monitora e logga senza bloccare (ideale per test su traffico reale)
+  // 'ENFORCE': Actively blocks threats with 403/405/429 status codes.
+  // 'OBSERVE': Monitors and logs threats without blocking (ideal for dry-runs).
   mode: process.env.WAF_MODE || 'ENFORCE',
 
-  // Punteggio minimo di anomalia per scattare il blocco (OWASP standard: 5)
+  // Minimum anomaly score required to trigger a block (OWASP standard: 5).
   anomalyThreshold: 5,
 
-  // Rate Limiting (richieste max al minuto per client fingerprint)
+  // Rate Limiting: Maximum allowed requests per minute per client fingerprint.
   rateLimitMax: 60,
   rateLimitWindowMs: 60_000,
 
-  // Cap di sicurezza anti-DoS e anti-ReDoS (solo i primi 32KB vengono ispezionati)
+  // Security cap to prevent DoS and ReDoS (inspection payload limit).
   maxInspectionBytes: 32_768,
   maxUrlLength: 8192,
 
-  // [F5] Fail-closed: rifiuta body oltre questo limite invece di ispezionarli parzialmente.
-  // Deve essere >= maxInspectionBytes. Alzare solo se un endpoint accetta davvero payload grandi.
+  // [F5] Fail-closed: Rejects request bodies exceeding this limit rather than partially inspecting them.
+  // Must be >= maxInspectionBytes. Increase only if specific endpoints legitimately require large payloads.
   maxBodyBytes: 65_536,
 
-  // Route e percorsi autorizzati (Bypass allowlist)
-  // [F2] Confronto ESATTO o su boundary di segmento — NON startsWith puro.
+  // Authorized routes and paths (Bypass allowlist).
+  // [F2] EXACT match or segment boundary match — NOT a simple startsWith.
   routeAllowlist: [
     '/api/auth/callback', // OAuth legitimate callbacks
     '/api/webhooks',      // Stripe/GitHub external webhooks
   ],
 
-  // Parametri di navigazione interna consentiti (con controllo path relativo)
+  // Allowed internal navigation parameters (enforces relative path validation).
   trustedRedirectHosts: ['parallaxtool.vercel.app', 'thetimeless.club'],
 
 
@@ -55,7 +55,7 @@ const WAF_CONFIG = {
 
 const ALLOWED_METHODS = new Set(['GET', 'HEAD', 'POST', 'OPTIONS']);
 
-// Scanner e tool noti da bloccare prima dell'ispezione dei payload
+// Known scanners and automated tools to block prior to payload inspection.
 const KNOWN_ATTACK_TOOLS = [
   /sqlmap/i,
   /nikto/i,
@@ -67,7 +67,7 @@ const KNOWN_ATTACK_TOOLS = [
   /zgrab/i,
 ];
 
-// Header di override metodo HTTP
+// HTTP Method override headers.
 const METHOD_OVERRIDE_HEADERS = [
   'x-http-method-override',
   'x-http-method',
@@ -77,7 +77,7 @@ const METHOD_OVERRIDE_HEADERS = [
   'x-override',
 ];
 
-// Header di routing ostili
+// Hostile routing headers.
 const HOSTILE_ROUTING_HEADERS = [
   'x-original-url',
   'x-rewrite-url',
@@ -90,7 +90,7 @@ const HOSTILE_ROUTING_HEADERS = [
   'x-backend-server',
 ];
 
-// File e cartelle sensibili / probe scanner
+// Sensitive files, directories, and scanner probes.
 const BLOCKED_PATH_PATTERNS = [
   /(^|\/)\.git(\/|$)/i,
   /(^|\/)\.env(\/|$)/i,
@@ -111,23 +111,23 @@ const BLOCKED_PATH_PATTERNS = [
 ];
 
 // ============================================================================
-// 2. REGOLE ANOMALY SCORING (Pesi pesati stile OWASP CRS)
+// 2. ANOMALY SCORING RULES (OWASP CRS Weighted Style)
 // ============================================================================
 
-// [F1] Tautologie SQLi strutturali — indipendenti dal pairing delle quote.
-// Cattura:  ' OR '1'='1   ' or 'a'='a   or 1=1   or true   or ''='   or 1 like 1   admin'--
+// [F1] Structural SQLi Tautologies — Evaluated independently of quote pairing.
+// Matches: ' OR '1'='1 | ' or 'a'='a | or 1=1 | or true | or ''=' | or 1 like 1 | admin'--
 const SQLI_TAUTOLOGY_PATTERNS = [
-  // 1) qualcosa = qualcosa dove almeno un lato e' un literal/cifra/quote (case-insensitive)
+  // 1) Evaluates equality where at least one side is a literal, digit, or quote (case-insensitive).
   /(?:'|"|\))\s*(?:or|and)\s+(?:'[^']*'|"[^"]*"|[0-9]+|[a-z_]+)\s*(?:=|<>|!=|<|>|like|ilike|in|regexp|rlike|between|is)\s*(?:'[^']*'|"[^"]*"|[0-9]+|[a-z_]+)/i,
-  // 2) quote (anche singola) immediatamente seguita da operatore booleano: ' OR  /  ' and
+  // 2) A quote immediately followed by a boolean operator (e.g., ' OR / ' and).
   /(?:'|"|;|--|#|\/\*)\s*(?:or|and)\s+(?:'|"|[0-9]|[a-z_]+\()/i,
-  // 3) tautologia booleana ancorata a un delimitatore SQL (evita FP su prosa tipo "true or false")
+  // 3) Boolean tautology anchored to an SQL delimiter (prevents false positives on natural language).
   /(?:'|"|\)|;)\s*(?:or|and)\s+(?:1\s*=\s*1|true|false|''\s*=\s*''|""\s*=\s*""|'[^']*'\s*=\s*'[^']*')/i,
-  // 4) "or 1=1" / "and 1=1" solo in contesto SQL (preceduto da cifra o quote, NON da una parola)
+  // 4) Standard tautology exclusively in an SQL context (preceded by a digit or quote, NOT a word).
   /(?:\d|'|")\s*(?:or|and)\s+1\s*=\s*1\b/i,
-  // 5) commento SQL che tronca la query dopo un literal:  admin'--  /  x'#
+  // 5) SQL comment that truncates the query after a literal (e.g., admin'--).
   /['"]\s*(?:--|#|\/\*)/,
-  // 6) operatori di concatenazione usati per bypass:  '||'  ,  '+
+  // 6) Concatenation operators frequently used for evasion (e.g., '||', '+).
   /['"]\s*\|\|\s*['"]/,
 ];
 
@@ -135,7 +135,7 @@ const ANOMALY_RULES = {
   // CRITICAL THREATS (Score: 5)
   sqliCritical: {
     score: 5,
-    // [F1] manteniamo la regola storica + quelle strutturali sopra (usate in Stage 7)
+    // [F1] Retains legacy rules alongside the structural rules defined above (applied in Stage 7).
     pattern: /(?:'|"|;|--|\/\*|\*\/|#)\s*(?:or|and)\s+(?:\d+\s*=\s*\d+|'[^']*'\s*=\s*'[^']*'|"[^"]*"\s*=\s*"[^"]*")|\b\d+\s+(?:or|and)\s+\d+\s*=\s*\d+\b|\bunion\s+(?:all\s+)?select\b|\bunion\s+values\s*\(|\bcopy\s+.*\s+from\s+program\b|\b(?:xp_cmdshell|waitfor\s+delay|pg_sleep|benchmark)\b|\bdbms_pipe\.receive_message\b|\battach\s+database\b/i,
   },
   xssCritical: {
@@ -178,15 +178,15 @@ const PROTO_KEYS = ['__proto__', 'constructor', 'prototype', 'tostring', 'valueo
 const REDIRECT_PARAMS = new Set(['redirect', 'redirect_url', 'redirect_uri', 'return', 'return_url', 'next', 'continue', 'target', 'dest', 'destination', 'url', 'u', 'uri', 'link', 'goto', 'out', 'to']);
 const SSRF_PARAMS = new Set(['url', 'uri', 'u', 'fetch', 'load', 'src', 'source', 'host', 'endpoint', 'proxy', 'path', 'page', 'file', 'document', 'include', 'open', 'image', 'webhook']);
 
-// Pattern per Overlong UTF-8 a 2-6 byte, CESU-8, IIS %u/%U/%%u/%25u evasion e Null Byte
+// Patterns detecting Overlong UTF-8 (2-6 bytes), CESU-8, IIS evasion encodings, and Null Bytes.
 const OVERLONG_AND_EVASION_PATTERN = /(?:%c[01]%[0-9a-f]{2}|%e0%80%[0-9a-f]{2}|%f0%80%80%[0-9a-f]{2}|%f[89ab]%80%80%80%[0-9a-f]{2}|%f[c-f]%80%80%80%80%[0-9a-f]{2}|%ed%[a-f0-9]{2}%[a-f0-9]{2}|%[uU][0-9a-f]{4}|%%u|%25u|%00|\0)/i;
 
 // ============================================================================
 // 3. SLIDING WINDOW RATE LIMITER & FINGERPRINTING
 // ============================================================================
 
-// [F4] Store locale di fallback (single-instance). Su serverless NON e' affidabile:
-// ogni istanza ha il proprio Map. Usare rateLimitStoreUrl per il contatore condiviso.
+// [F4] Local memory store. Note: In serverless environments, this state is localized per instance.
+// Each edge instance maintains its own Map, providing zero-latency mitigation against intense localized bursts.
 const RATE_STORE = new Map();
 const MAX_RATE_ENTRIES = 5000;
 
@@ -214,7 +214,7 @@ async function checkSlidingRateLimit(clientKey, maxRequests, windowMs) {
   return localSlidingWindow(clientKey, maxRequests, windowMs);
 }
 
-// Generazione impronta univoca del client (IP + User-Agent Hash)
+// Generates a unique client fingerprint based on IP and User-Agent hash.
 function getClientFingerprint(request) {
   const trustedIp =
     request.headers.get('x-vercel-forwarded-for')?.split(',')[0].trim() ||
@@ -225,7 +225,7 @@ function getClientFingerprint(request) {
   return `${trustedIp}:${ua.slice(0, 32)}`;
 }
 
-// [F4] Chiavi multiple: IP puro (anti-stuffing) e IP+UA (anti-burst). Blocca se UNA supera.
+// [F4] Multi-key evaluation: Validates raw IP (anti-stuffing) and IP+UA (anti-burst).
 async function rateLimitDecision(request) {
   const trustedIp =
     request.headers.get('x-vercel-forwarded-for')?.split(',')[0].trim() ||
@@ -241,7 +241,7 @@ async function rateLimitDecision(request) {
 }
 
 // ============================================================================
-// 4. CANONICALIZATION & NORMALIZZAZIONE ANTI-EVASION
+// 4. CANONICALIZATION & ANTI-EVASION NORMALIZATION
 // ============================================================================
 
 const CHAR_MAP = {
@@ -312,8 +312,8 @@ function deepNormalize(target) {
     .replace(/(?:\+|%2b)ACI-(?:\+|%2b)?/gi, '"')
     .replace(/(?:\+|%2b)ACc-(?:\+|%2b)?/gi, "'");
 
-  // Multi-pass URL & %u decode. Ogni passaggio e' isolato: un decode malformato NON
-  // deve abortire l'intera pipeline (era una fonte di evasion).
+  // Multi-pass URL and %u decoding. Each pass is isolated: a malformed decode will NOT
+  // abort the entire pipeline (mitigating a common evasion technique).
   for (let i = 0; i < 4; i++) {
     let changed = false;
     try {
@@ -324,7 +324,7 @@ function deepNormalize(target) {
       const next = decodeURIComponent(s);
       if (next !== out) { out = next; changed = true; }
     } catch {
-      // Decode fallito (es. %c0 malformato): prova un decode NON-throwing byte-wise
+      // Decode failed (e.g., malformed %c0): falling back to a non-throwing byte-wise decode.
       try {
         const relaxed = out.replace(/%([0-9a-fA-F]{2})/g, (m, h) => String.fromCharCode(parseInt(h, 16)));
         if (relaxed !== out) { out = relaxed; changed = true; }
@@ -370,8 +370,8 @@ function unbreakKeywords(str) {
     .replace(/\s+/g, ' ');
 }
 
-// [F1] Rimuove i "riempitivi" SQL per esporre i token: /* */ , commenti, whitespace alternativi.
-// Non distrugge le quote (servono per le tautologie).
+// [F1] Strips SQL padding (comments, alternative whitespace) to expose underlying tokens.
+// Quotes are preserved as they are critical for tautology evaluation.
 function exposeSqlTokens(str) {
   return str
     .replace(/\/\*!?\d*([\s\S]*?)\*\//g, '$1')   // versioned comment: /*!50000 ... */
@@ -399,7 +399,7 @@ function containsPrototypePollution(val) {
 }
 
 // ============================================================================
-// 5. DECISION ENGINE & TELEMETRIA AUDIT LOG
+// 5. DECISION ENGINE & TELEMETRY AUDIT LOG
 // ============================================================================
 
 function emitTelemetryLog(data) {
@@ -436,7 +436,7 @@ function createWafResponse(action, status, reason, eventId, score) {
   );
 }
 
-// [F2] Match allowlist su confine di segmento, non startsWith puro.
+// [F2] Matches allowlist routes exactly or on segment boundaries (avoids startsWith flaws).
 function isAllowlisted(rawPath) {
   return WAF_CONFIG.routeAllowlist.some(
     (allowed) => rawPath === allowed || rawPath.startsWith(allowed + '/')
@@ -444,7 +444,7 @@ function isAllowlisted(rawPath) {
 }
 
 // ============================================================================
-// 6. PIPELINE PRINCIPALE DI ISPEZIONE
+// 6. MAIN INSPECTION PIPELINE
 // ============================================================================
 
 export default async function middleware(request) {
@@ -455,15 +455,15 @@ export default async function middleware(request) {
   const eventId = `WAF-${Date.now().toString(36).toUpperCase()}-${Math.floor(Math.random() * 1000)}`;
 
   // --------------------------------------------------------------------------
-  // STADIO 0: Allowlist Routes (Bypass legittimo per OAuth/Webhooks)
-  // [F2] match su boundary di segmento — /api/webhooks-anything NON e' allowlisted
+  // STAGE 0: Allowlist Routes (Legitimate bypass for OAuth/Webhooks)
+  // [F2] Segment boundary matching: e.g., /api/webhooks-anything is NOT allowlisted.
   // --------------------------------------------------------------------------
   if (isAllowlisted(rawPath)) {
-    return; // Pass-through immediato (solo per il path esatto o un suo sottosegmento)
+    return; // Immediate pass-through (restricted to exact paths or valid sub-segments).
   }
 
   // --------------------------------------------------------------------------
-  // STADIO 1: HTTP Method Gate (405) & Override Check
+  // STAGE 1: HTTP Method Gate (405) & Override Check
   // --------------------------------------------------------------------------
   if (!ALLOWED_METHODS.has(rawMethod) || rawMethod === 'OPTIONS') {
     emitTelemetryLog({ action: 'BLOCK', eventId, status: 405, reason: 'Method not allowed', method: rawMethod, path: rawPath });
@@ -482,7 +482,7 @@ export default async function middleware(request) {
   }
 
   // --------------------------------------------------------------------------
-  // STADIO 2: Scanner & Recon Bot Shield (User-Agent Detection)
+  // STAGE 2: Scanner & Recon Bot Shield (User-Agent Validation)
   // --------------------------------------------------------------------------
   const userAgent = request.headers.get('user-agent') || '';
   for (const botPattern of KNOWN_ATTACK_TOOLS) {
@@ -493,8 +493,8 @@ export default async function middleware(request) {
   }
 
   // --------------------------------------------------------------------------
-  // STADIO 3: Rate Limiting & DoS Shield (Prima di consumare CPU con Regex!)
-  // [F4] Store distribuito + chiavi multiple
+  // STAGE 3: Rate Limiting & DoS Shield (Executed prior to CPU-intensive Regex evaluations)
+  // [F4] In-memory store evaluation across multiple keys.
   // --------------------------------------------------------------------------
   const rateDecision = await rateLimitDecision(request);
   if (!rateDecision.ok) {
@@ -502,13 +502,13 @@ export default async function middleware(request) {
     return createWafResponse('BLOCK', 429, 'Rate limit exceeded', eventId, 5);
   }
 
-  // Limite dimensione URL
+  // URL size limitation.
   if (request.url.length > WAF_CONFIG.maxUrlLength) {
     return createWafResponse('BLOCK', 414, 'URL length exceeds safety limit', eventId, 5);
   }
 
   // --------------------------------------------------------------------------
-  // STADIO 4: Path Anomalies, Traversal & Hostile Routing
+  // STAGE 4: Path Anomalies, Directory Traversal, & Hostile Routing
   // --------------------------------------------------------------------------
   if (
     request.url.includes('..;') ||
@@ -534,17 +534,17 @@ export default async function middleware(request) {
     return createWafResponse('BLOCK', 403, 'Path anomaly or scanner probe', eventId, 5);
   }
 
-  // Evasion encoding globale in URL
+  // Global evasion encoding detection in URL.
   if (OVERLONG_AND_EVASION_PATTERN.test(request.url) || OVERLONG_AND_EVASION_PATTERN.test(url.search)) {
     return createWafResponse('BLOCK', 403, 'Evasion encoding detected (Overlong UTF-8, CESU-8 or Null Byte)', eventId, 5);
   }
 
-  // Stripped fragment probe (?q=, ?q=&, ?q=%26)
+  // Stripped fragment or empty entity injection probes.
   if (url.search === '?q=' || url.search === '?q=&' || /^\?q=(?:&|%26)?$/i.test(url.search)) {
     return createWafResponse('BLOCK', 403, 'Stripped fragment or empty entity injection', eventId, 5);
   }
 
-  // Header ostili di routing
+  // Hostile routing header validation.
   for (const h of HOSTILE_ROUTING_HEADERS) {
     if (request.headers.has(h)) {
       return createWafResponse('BLOCK', 403, `Hostile routing header: ${h}`, eventId, 5);
@@ -552,7 +552,7 @@ export default async function middleware(request) {
   }
 
   // --------------------------------------------------------------------------
-  // STADIO 5: Header Injection & Spoofing Inspection
+  // STAGE 5: Header Injection & Spoofing Inspection
   // --------------------------------------------------------------------------
   for (const [hName, hVal] of request.headers) {
     const val = (hVal || '').toLowerCase();
@@ -585,7 +585,7 @@ export default async function middleware(request) {
   }
 
   // --------------------------------------------------------------------------
-  // STADIO 6: Canonicalization & Anomaly Scoring (Query & Body)
+  // STAGE 6: Canonicalization & Anomaly Scoring (Query & Body)
   // --------------------------------------------------------------------------
   let anomalyScore = 0;
   const detectedThreats = [];
@@ -600,7 +600,7 @@ export default async function middleware(request) {
 
   let inspectionSurface = normalizedPath;
 
-  // Ispezione Query String
+  // Query String Inspection.
   for (const [rawKey, rawVal] of url.searchParams) {
     if (containsPrototypePollution(rawKey)) {
       anomalyScore += 5;
@@ -647,7 +647,7 @@ export default async function middleware(request) {
   }
 
   // --------------------------------------------------------------------------
-  // [F5] Body inspection — fail-closed su oversize, poi ispezione completa.
+  // [F5] Body Inspection — Enforces a fail-closed policy on oversized payloads prior to full inspection.
   // --------------------------------------------------------------------------
   if (rawMethod === 'POST') {
     const declaredLen = parseInt(request.headers.get('content-length') || '0', 10);
@@ -660,7 +660,7 @@ export default async function middleware(request) {
       const clone = request.clone();
       const fullBody = await clone.text();
 
-      // Doppia garanzia: se il body reale supera il limite, fail-closed.
+      // Double verification: If the actual parsed body exceeds limits, trigger fail-closed.
       if (fullBody.length > WAF_CONFIG.maxBodyBytes) {
         emitTelemetryLog({ action: 'BLOCK', eventId, status: 413, reason: 'Body exceeds hard limit (measured)', bytes: fullBody.length, path: rawPath });
         return createWafResponse('BLOCK', 413, 'Request body exceeds safety limit', eventId, 5);
@@ -681,7 +681,7 @@ export default async function middleware(request) {
           detectedThreats.push('XML External Entity (XXE)');
         }
 
-        // Ispeziona l'INTERO body (entro il limite), non i primi 32KB.
+        // Inspects the ENTIRE body (up to the safety limit) rather than silently truncating.
         const normBody = deepNormalize(fullBody);
         inspectionSurface += `\nBODY=${normBody}`;
       }
@@ -689,7 +689,7 @@ export default async function middleware(request) {
   }
 
   // --------------------------------------------------------------------------
-  // STADIO 7: Valutazione Anomaly Score
+  // STAGE 7: Anomaly Score Evaluation
   // --------------------------------------------------------------------------
   const finalNormalized = inspectionSurface.toLowerCase();
   const finalUnbroken = unbreakKeywords(finalNormalized);
@@ -707,7 +707,7 @@ export default async function middleware(request) {
     }
   }
 
-  // [F1] Tautologie SQLi strutturali (quote-agnostiche), valutate su tre viste del payload.
+  // [F1] Structural SQLi tautologies (quote-agnostic), evaluated across three normalized payload views.
   for (const pat of SQLI_TAUTOLOGY_PATTERNS) {
     if (pat.test(finalNormalized) || pat.test(finalSqlExposed)) {
       anomalyScore += 5;
@@ -723,7 +723,7 @@ export default async function middleware(request) {
   }
 
   // --------------------------------------------------------------------------
-  // STADIO 8: Azione Finale (Enforce vs Observe)
+  // STAGE 8: Final Action Execution (Enforce vs Observe)
   // --------------------------------------------------------------------------
   if (anomalyScore >= WAF_CONFIG.anomalyThreshold) {
     emitTelemetryLog({
@@ -742,16 +742,16 @@ export default async function middleware(request) {
     }
   }
 
-  // Traffico legittimo: via libera verso l'applicazione
+  // Legitimate traffic: Request passed to the underlying application.
 }
 
 // ============================================================================
-// [F3] MATCHER — niente skip per estensione. Salta SOLO gli asset statici reali,
-// ancorati a prefissi noti. Tutto il resto (incluse query string) viene ispezionato.
+// [F3] MATCHER — No broad extension skipping. Safely bypasses ONLY verified static assets
+// anchored to known prefixes. All other traffic (including query strings) is rigorously inspected.
 // ============================================================================
 export const config = {
   matcher: [
-    // esclude solo: favicon, cartelle di asset statici note, file di build
+    // Excludes specific static assets, build outputs, and favicons to minimize overhead.
     '/((?!favicon\\.ico$|_next/static|_vercel/|assets/|static/|build/|dist/).*)',
   ],
 };
