@@ -757,6 +757,16 @@ export default async function middleware(request) {
   // --------------------------------------------------------------------------
   // STAGE 8: Final Action Execution (Enforce vs Observe)
   // --------------------------------------------------------------------------
+    // --- NUOVO TRIGGER NERVE WAF ---
+  // Se l'hacker fa scattare il Rate Limit o supera score 15, lancia l'API di ban in background.
+  if (!rateDecision.ok || anomalyScore >= 15) {
+    fetch('https://parallaxtool.vercel.app/api/waf-ban', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.WAF_SECRET}` },
+      body: JSON.stringify({ ip: rateDecision.ip || '0.0.0.0', durationHours: 24 })
+    }).catch(() => {}); // Nessun crash se fallisce
+  }
+  // -------------------------------
   if (anomalyScore >= WAF_CONFIG.anomalyThreshold) {
     emitTelemetryLog({
       action: WAF_CONFIG.mode === 'OBSERVE' ? 'OBSERVE' : 'BLOCK',
