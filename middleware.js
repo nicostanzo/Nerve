@@ -48,6 +48,7 @@ const WAF_CONFIG = {
   routeAllowlist: [
     '/api/auth/callback', // OAuth legitimate callbacks
     '/api/webhooks',      // Stripe/GitHub external webhooks
+    '/api/waf-ban',       // Internal WAF ban enforcement API
   ],
 
   // Allowed internal navigation parameters (enforces relative path validation).
@@ -465,19 +466,21 @@ export default async function middleware(request) {
       // Native fetch to Edge Config URL (zero external dependencies).
       // Expected Edge Config structure: { "waf_banned_ips": { "192.168.1.1": "2026-12-31T23:59:59Z" } }
       const edgeUrl = new URL(process.env.EDGE_CONFIG);
-      edgeUrl.pathname = `/v1/items`; // Fetch all config items
+      edgeUrl.pathname = edgeUrl.pathname.replace(/\/$/, '') + '/items';
       
       const res = await fetch(edgeUrl.toString());
       if (res.ok) {
         const configData = await res.json();
         const bannedIps = configData.waf_banned_ips || {};
-        const clientIp = request.headers.get('x-vercel-forwarded-for')?.split(',')[0].trim() || request.headers.get('x-real-ip');
+        const clientIp = request.headers.get('x-vercel-forwarded-for')?.split(',')[0].trim() ||
+                         request.headers.get('x-real-ip') ||
+                         request.headers.get('x-forwarded-for')?.split(',')[0].trim();
         
         if (clientIp && bannedIps[clientIp]) {
           const unbanTime = new Date(bannedIps[clientIp]);
           if (unbanTime > new Date()) {
              emitTelemetryLog({ action: 'BLOCK', eventId, status: 403, reason: 'IP is globally banned (Edge Config)', ip: clientIp, path: rawPath });
-             return createWafResponse('BLOCK', 403, 'IP is globally banned', eventId, 100);
+             return createWafResponse('BLOCK', 403, 'IP is globally banned by Nerve WAF', eventId, 100);
           }
         }
       }
@@ -757,6 +760,21 @@ export default async function middleware(request) {
   // --------------------------------------------------------------------------
   // STAGE 8: Final Action Execution (Enforce vs Observe)
   // --------------------------------------------------------------------------
+  // --- NUOVO TRIGGER NERVE WAF (Automated Global Ban) ---
+  // If rate limit breached or anomaly score >= 15, trigger automated global Edge Config ban
+  if (!rateDecision.ok || anomalyScore >= 15) {
+    const banIp = rateDecision.ip || request.headers.get('x-vercel-forwarded-for')?.split(',')[0].trim() || request.headers.get('x-real-ip');
+    if (banIp && banIp !== '0.0.0.0' && banIp !== 'unknown') {
+      try {
+        await fetch('https://parallaxtool.vercel.app/api/waf-ban', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${process.env.WAF_SECRET}` },
+          body: JSON.stringify({ ip: banIp, durationHours: 24 })
+        });
+      } catch (e) {}
+    }
+  }
+  // -------------------------------------------------------
   if (anomalyScore >= WAF_CONFIG.anomalyThreshold) {
     emitTelemetryLog({
       action: WAF_CONFIG.mode === 'OBSERVE' ? 'OBSERVE' : 'BLOCK',
